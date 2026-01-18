@@ -277,9 +277,10 @@ async def crawl(args):
 
                 queue.append(u)
 
-                for wp_u in wp_expand(u):
-                    if not is_recursive_trap(wp_u):
-                        queue.append(wp_u)
+                if args.wp_expand:
+                    for wp_u in wp_expand(u):
+                        if not is_recursive_trap(wp_u):
+                            queue.append(wp_u)
 
             visited.add(key)
             await asyncio.sleep(args.delay)
@@ -329,6 +330,12 @@ def main():
     ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     ap.add_argument("--delay", type=float, default=DEFAULT_DELAY)
     ap.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES)
+
+    ap.add_argument(
+        "--wp-expand",
+        action="store_true",
+        help="Expand WordPress /embed/ URLs"
+    )
 
     args = ap.parse_args()
 
