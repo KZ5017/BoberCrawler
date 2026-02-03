@@ -7,9 +7,13 @@ import sys
 import os
 from html import unescape
 from urllib.parse import urljoin, urlparse, unquote
+from datetime import datetime
 
 from playwright.async_api import async_playwright
 from playwright.sync_api import sync_playwright
+
+
+# ---------------- BROWSER CHECK ----------------
 
 def ensure_browser():
     try:
@@ -26,7 +30,24 @@ def ensure_browser():
 
 # ---------------- CONFIG ----------------
 
-LOG_FILE = "bobercrawler.log"
+def build_log_filename(start_url: str):
+    p = urlparse(start_url)
+
+    host = (p.hostname or "site").replace(".", "-")
+
+    path = p.path.strip("/")
+    if path:
+        path = path.replace("/", "_")
+    else:
+        path = "root"
+
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M")
+
+    return f"{host}_{path}_{ts}.log"
+
+PROXY_HOST = "127.0.0.1"
+PROXY_PORT = 8080
+
 DEFAULT_TIMEOUT = 15000
 DEFAULT_DELAY = 0.15
 DEFAULT_MAX_PAGES = 1000
@@ -41,14 +62,6 @@ USER_AGENT = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
 
 # ---------------- HELPERS ----------------
 
@@ -69,12 +82,10 @@ def in_scope(url, scope):
 
     if p.scheme != scope["scheme"]:
         return False
-
     if p.hostname != scope["host"]:
         return False
 
-    path = p.path or "/"
-    return path.startswith(scope["path"])
+    return (p.path or "/").startswith(scope["path"])
 
 
 def is_excluded(url, excluded):
@@ -125,7 +136,6 @@ def smart_key(url, query_agnostic_paths):
         if path.startswith(prefix):
             return f"{p.scheme}://{p.hostname}{path}"
 
-    # default behavior
     params = []
     if p.query:
         for part in p.query.split("&"):
@@ -159,8 +169,7 @@ def exceeds_state_token_limit(url, tokens, max_repeat):
                     query_parts.append(part)
 
     for token in tokens:
-        total = path_parts.count(token) + query_parts.count(token)
-        if total > max_repeat:
+        if path_parts.count(token) + query_parts.count(token) > max_repeat:
             return True
 
     return False
@@ -210,7 +219,9 @@ async def crawl(args):
     visited = set()
     queue = [args.start_url]
 
-    proxy = {"server": f"http://{args.proxy_host}:{args.proxy_port}"}
+    proxy = None
+    if not args.no_proxy:
+        proxy = {"server": f"http://{args.proxy_host}:{args.proxy_port}"}
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True, proxy=proxy)
@@ -227,26 +238,27 @@ async def crawl(args):
         page = await ctx.new_page()
         page.set_default_navigation_timeout(args.timeout)
 
+        ws_seen = False
+
+        def _on_ws(ws):
+            nonlocal ws_seen
+            ws_seen = True
+            logging.info("WebSocket opened: %s", ws.url)
+
+        page.on("websocket", _on_ws)
+
+
         while queue and len(visited) < args.max_pages:
+            ws_seen = False
             url = queue.pop(0)
 
             if not in_scope(url, args.scope):
                 continue
-
             if is_excluded(url, args.exclude_paths):
-                logging.info("Excluded: %s", url)
                 continue
-
             if is_recursive_trap(url):
-                logging.info("Recursive trap filtered: %s", url)
                 continue
-
-            if exceeds_state_token_limit(
-                url,
-                args.state_tokens,
-                args.state_max_repeat
-            ):
-                logging.info("State token limit hit: %s", url)
+            if exceeds_state_token_limit(url, args.state_tokens, args.state_max_repeat):
                 continue
 
             key = smart_key(url, args.query_agnostic_paths)
@@ -257,22 +269,38 @@ async def crawl(args):
 
             try:
                 await page.goto(url, wait_until="load")
+
+                if args.ws_aware:
+                    try:
+                        # adjunk időt a WS initre
+                        await asyncio.sleep(1.0)
+                    except Exception:
+                        pass
+
+                if args.ws_aware and ws_seen:
+                    logging.info("WS-aware: WS seen, waiting for DOM settle")
+
+                    try:
+                        await page.wait_for_function(
+                            "() => document.body && document.body.innerText.length > 300",
+                            timeout=6000
+                        )
+                    except Exception:
+                        await asyncio.sleep(1.0)
+
                 html = await page.content()
+
             except Exception as e:
                 logging.warning("Failed: %s (%s)", url, e)
                 visited.add(key)
                 continue
 
             for u in extract_urls(html, url):
-                if not in_scope(url, args.scope):
+                if not in_scope(u, args.scope):
                     continue
                 if is_recursive_trap(u):
                     continue
-                if exceeds_state_token_limit(
-                    u,
-                    args.state_tokens,
-                    args.state_max_repeat
-                ):
+                if exceeds_state_token_limit(u, args.state_tokens, args.state_max_repeat):
                     continue
 
                 queue.append(u)
@@ -290,59 +318,122 @@ async def crawl(args):
 
 # ---------------- CLI ----------------
 
-def main():
+def print_examples():
+    print("""
+==========================
+BoberCrawler – Examples
+==========================
 
+1) Minimal crawl
+----------------
+bober-crawler \\
+  --start-url 'https://example.com/' \\
+  --scope 'https://example.com' \\
+  --no-proxy
+
+
+2) WordPress site expansion + State-aware crawl (token-based)
+----------------------------------
+bober-crawler \\
+  --start-url 'https://wp-site.example' \\
+  --scope 'https://wp-site.example' \\
+  --state-tokens 'embed,feed,rss2' \\
+  --state-max-repeat 1 \\
+  --wp-expand \\
+  --query-agnostic-paths '/search,/shop' \\
+  --exclude-paths '/wp-admin,/wp-login.php' \\
+
+
+3) WebSocket-gated content
+--------------------------
+bober-crawler \\
+  --start-url 'https://example.com/app' \\
+  --scope 'https://example.com' \\
+  --ws-aware \\
+  --proxy-port 9090
+
+
+4) Custom port + cookies (authenticated area) + aggressive filtering
+-------------------------------------
+bober-crawler \\
+  --start-url 'https://example.com:8443/app' \\
+  --scope 'https://example.com:8443' \\
+  --cookie 'sessionid=abc123; csrftoken=xyz' \\
+  --exclude-paths '/logout,/static,/cdn' \\
+  --query-agnostic-paths '/search,/shop' \\
+  --delay 0.05 \\
+  --max-pages 500 \\
+  --proxy-host 192.168.1.111 \\
+  --proxy-port 9090
+
+==========================
+""".strip())
+
+
+def main():
     ensure_browser()
 
-    ap = argparse.ArgumentParser(description="Burp-friendly Playwright crawler (smart-only)")
+    ap = argparse.ArgumentParser(
+        description="Burp-friendly Playwright crawler",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        add_help=True
+    )
 
-    ap.add_argument("--start-url", required=True)
-    ap.add_argument(
-        "--scope",
-        required=True,
-        help="URL with protocol,host,path. (e.g. https://bober.pol or https://bober.pol/bobers)")
+    REQUIRED = " (REQUIRED)"
 
-    ap.add_argument("--proxy-host", required=True)
-    ap.add_argument("--proxy-port", required=True, type=int)
+    # --- optional example flag ---
+    ap.add_argument("--example", action="store_true",
+                    help="Show usage examples and exit")
 
+    # --- add all other arguments WITHOUT required=True ---
+    ap.add_argument("--start-url", help="Starting URL" + REQUIRED)
+    ap.add_argument("--scope", help="Scope URL (protocol+host+path)" + REQUIRED)
+    ap.add_argument("--proxy-host", default=PROXY_HOST, help="Proxy host (default: 127.0.0.1)")
+    ap.add_argument("--proxy-port", type=int, default=PROXY_PORT, help="Proxy port (default: 8080)")
+    ap.add_argument("--no-proxy", action="store_true", help="Disable proxy entirely")
     ap.add_argument("--cookie")
-    ap.add_argument("--exclude-paths", default="")
+    ap.add_argument("--exclude-paths", default="", help="Comma-separated path prefixes to skip")
+    ap.add_argument("--query-agnostic-paths", default="", help="Paths where query string is ignored")
+    ap.add_argument("--state-tokens", default="", help="Limits recursion caused by repeating tokens")
+    ap.add_argument("--state-max-repeat", type=int, default=2, help="Max allowed repeats of same state")
+    ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="Navigation timeout in ms")
+    ap.add_argument("--delay", type=float, default=DEFAULT_DELAY, help="Delay between requests (seconds)")
+    ap.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES, help="Maximum pages to crawl")
+    ap.add_argument("--wp-expand", action="store_true", help="Expand WordPress endpoints")
+    ap.add_argument("--ws-aware", action="store_true", help="Wait for WebSocket-gated content before extraction")
 
-    ap.add_argument(
-        "--query-agnostic-paths",
-        default="",
-        help="Comma separated path prefixes where query string is ignored for deduplication (e.g. /shop,/shop/)"
-    )
-
-    ap.add_argument(
-        "--state-tokens",
-        default="",
-        help="Comma separated tokens to limit recursion (e.g. embed,feed,rss2)"
-    )
-
-    ap.add_argument(
-        "--state-max-repeat",
-        type=int,
-        default=2,
-        help="Max allowed repetition per state token"
-    )
-
-    ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
-    ap.add_argument("--delay", type=float, default=DEFAULT_DELAY)
-    ap.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES)
-
-    ap.add_argument(
-        "--wp-expand",
-        action="store_true",
-        help="Expand WordPress /embed/ URLs"
-    )
-
+    # --- first parse ---
     args = ap.parse_args()
 
+    # --- example handling ---
+    if args.example:
+        print_examples()
+        sys.exit(0)
+
+    # --- now check manually that required args exist ---
+    required_args = ["start_url", "scope"]
+    missing = [a for a in required_args if getattr(args, a) is None]
+    if missing:
+        ap.error(f"Missing required arguments: {', '.join(missing)}")
+
+    # --- normalize args ---
     args.scope = parse_scope(args.scope)
     args.exclude_paths = [p.strip() for p in args.exclude_paths.split(",") if p.strip()]
     args.query_agnostic_paths = [p.rstrip("/") for p in args.query_agnostic_paths.split(",") if p.strip()]
     args.state_tokens = [t.strip().lower() for t in args.state_tokens.split(",") if t.strip()]
+
+    # --- logging setup ---
+    log_file = build_log_filename(args.start_url)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.FileHandler(log_file, encoding="utf-8"),
+                  logging.StreamHandler(sys.stdout)]
+    )
+
+    logging.info("Log file: %s", log_file)
+    logging.info("Start URL: %s | Scope: %s://%s%s",
+                 args.start_url, args.scope["scheme"], args.scope["host"], args.scope["path"])
 
     asyncio.run(crawl(args))
 
