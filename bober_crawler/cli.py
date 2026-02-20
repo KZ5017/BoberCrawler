@@ -371,72 +371,76 @@ bober-crawler \\
 
 
 def main():
-    ensure_browser()
+    try:
+        ensure_browser()
 
-    ap = argparse.ArgumentParser(
-        description="Burp-friendly Playwright crawler",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        add_help=True
-    )
+        ap = argparse.ArgumentParser(
+            description="Burp-friendly Playwright crawler",
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+            add_help=True
+        )
 
-    REQUIRED = " (REQUIRED)"
+        REQUIRED = " (REQUIRED)"
 
-    # --- optional example flag ---
-    ap.add_argument("--example", action="store_true",
-                    help="Show usage examples and exit")
+        # --- optional example flag ---
+        ap.add_argument("--example", action="store_true",
+                        help="Show usage examples and exit")
 
-    # --- add all other arguments WITHOUT required=True ---
-    ap.add_argument("--start-url", help="Starting URL" + REQUIRED)
-    ap.add_argument("--scope", help="Scope URL (protocol+host+path)" + REQUIRED)
-    ap.add_argument("--proxy-host", default=PROXY_HOST, help="Proxy host (default: 127.0.0.1)")
-    ap.add_argument("--proxy-port", type=int, default=PROXY_PORT, help="Proxy port (default: 8080)")
-    ap.add_argument("--no-proxy", action="store_true", help="Disable proxy entirely")
-    ap.add_argument("--cookie")
-    ap.add_argument("--exclude-paths", default="", help="Comma-separated path prefixes to skip")
-    ap.add_argument("--query-agnostic-paths", default="", help="Paths where query string is ignored")
-    ap.add_argument("--state-tokens", default="", help="Limits recursion caused by repeating tokens")
-    ap.add_argument("--state-max-repeat", type=int, default=2, help="Max allowed repeats of same state")
-    ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="Navigation timeout in ms")
-    ap.add_argument("--delay", type=float, default=DEFAULT_DELAY, help="Delay between requests (seconds)")
-    ap.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES, help="Maximum pages to crawl")
-    ap.add_argument("--wp-expand", action="store_true", help="Expand WordPress endpoints")
-    ap.add_argument("--ws-aware", action="store_true", help="Wait for WebSocket-gated content before extraction")
+        # --- add all other arguments WITHOUT required=True ---
+        ap.add_argument("--start-url", help="Starting URL" + REQUIRED)
+        ap.add_argument("--scope", help="Scope URL (protocol+host+path)" + REQUIRED)
+        ap.add_argument("--proxy-host", default=PROXY_HOST, help="Proxy host")
+        ap.add_argument("--proxy-port", type=int, default=PROXY_PORT, help="Proxy port")
+        ap.add_argument("--no-proxy", action="store_true", help="Disable proxy entirely")
+        ap.add_argument("--cookie")
+        ap.add_argument("--exclude-paths", default="", help="Comma-separated path prefixes to skip")
+        ap.add_argument("--query-agnostic-paths", default="", help="Paths where query string is ignored")
+        ap.add_argument("--state-tokens", default="", help="Limits recursion caused by repeating tokens")
+        ap.add_argument("--state-max-repeat", type=int, default=2, help="Max allowed repeats of same state")
+        ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="Navigation timeout in ms")
+        ap.add_argument("--delay", type=float, default=DEFAULT_DELAY, help="Delay between requests (seconds)")
+        ap.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES, help="Maximum pages to crawl")
+        ap.add_argument("--wp-expand", action="store_true", help="Expand WordPress endpoints")
+        ap.add_argument("--ws-aware", action="store_true", help="Wait for WebSocket-gated content before extraction")
 
-    # --- first parse ---
-    args = ap.parse_args()
+        # --- first parse ---
+        args = ap.parse_args()
 
-    # --- example handling ---
-    if args.example:
-        print_examples()
+        # --- example handling ---
+        if args.example:
+            print_examples()
+            sys.exit(0)
+
+        # --- now check manually that required args exist ---
+        required_args = ["start_url", "scope"]
+        missing = [a for a in required_args if getattr(args, a) is None]
+        if missing:
+            ap.error(f"Missing required arguments: {', '.join(missing)}")
+
+        # --- normalize args ---
+        args.scope = parse_scope(args.scope)
+        args.exclude_paths = [p.strip() for p in args.exclude_paths.split(",") if p.strip()]
+        args.query_agnostic_paths = [p.rstrip("/") for p in args.query_agnostic_paths.split(",") if p.strip()]
+        args.state_tokens = [t.strip().lower() for t in args.state_tokens.split(",") if t.strip()]
+
+        # --- logging setup ---
+        log_file = build_log_filename(args.start_url)
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(message)s",
+            handlers=[logging.FileHandler(log_file, encoding="utf-8"),
+                    logging.StreamHandler(sys.stdout)]
+        )
+
+        logging.info("Log file: %s", log_file)
+        logging.info("Start URL: %s | Scope: %s://%s%s",
+                    args.start_url, args.scope["scheme"], args.scope["host"], args.scope["path"])
+
+        asyncio.run(crawl(args))
+
+    except KeyboardInterrupt:
+        print("\n[INTERRUPT] Execution interrupted by user. Exiting...\n")
         sys.exit(0)
-
-    # --- now check manually that required args exist ---
-    required_args = ["start_url", "scope"]
-    missing = [a for a in required_args if getattr(args, a) is None]
-    if missing:
-        ap.error(f"Missing required arguments: {', '.join(missing)}")
-
-    # --- normalize args ---
-    args.scope = parse_scope(args.scope)
-    args.exclude_paths = [p.strip() for p in args.exclude_paths.split(",") if p.strip()]
-    args.query_agnostic_paths = [p.rstrip("/") for p in args.query_agnostic_paths.split(",") if p.strip()]
-    args.state_tokens = [t.strip().lower() for t in args.state_tokens.split(",") if t.strip()]
-
-    # --- logging setup ---
-    log_file = build_log_filename(args.start_url)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[logging.FileHandler(log_file, encoding="utf-8"),
-                  logging.StreamHandler(sys.stdout)]
-    )
-
-    logging.info("Log file: %s", log_file)
-    logging.info("Start URL: %s | Scope: %s://%s%s",
-                 args.start_url, args.scope["scheme"], args.scope["host"], args.scope["path"])
-
-    asyncio.run(crawl(args))
-
 
 if __name__ == "__main__":
     main()
