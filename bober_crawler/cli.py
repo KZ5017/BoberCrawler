@@ -4422,7 +4422,9 @@ def is_transient_navigation_error(exc):
     message = str(exc or "").lower()
     return (
         "page is navigating and changing the content" in message or
-        "unable to retrieve content because the page is navigating" in message
+        "unable to retrieve content because the page is navigating" in message or
+        "execution context was destroyed" in message or
+        "most likely because of a navigation" in message
     )
 
 
@@ -7793,7 +7795,14 @@ async def submit_active_form(context, page_url, form, args, request_specs=None, 
 
 
 async def process_active_forms(page, page_url, args, submitted_forms, request_specs=None, max_request_specs=None):
-    forms = await discover_forms(page, page_url)
+    try:
+        forms = await discover_forms(page, page_url)
+    except Exception as e:
+        if is_transient_navigation_error(e):
+            logging.debug("Active form discovery skipped after navigation race: %s (%s)", page_url, e)
+            return []
+        raise
+
     if not forms:
         return []
 
@@ -7912,7 +7921,14 @@ async def trigger_active_action(context, page_url, action, args):
 
 
 async def process_active_actions(page, page_url, args, triggered_actions):
-    actions = await discover_active_actions(page, page_url)
+    try:
+        actions = await discover_active_actions(page, page_url)
+    except Exception as e:
+        if is_transient_navigation_error(e):
+            logging.debug("Active action discovery skipped after navigation race: %s (%s)", page_url, e)
+            return []
+        raise
+
     if not actions:
         return []
 
