@@ -58,7 +58,7 @@ DEFAULT_PROXY_SERVER = f"http://{PROXY_HOST}:{PROXY_PORT}"
 DEFAULT_TIMEOUT = 15000
 DEFAULT_DELAY = 0.15
 DEFAULT_MAX_PAGES = 1000
-DEFAULT_MAX_DEPTH = 6
+DEFAULT_MAX_DEPTH = 4
 DEFAULT_MAX_MUTATIONS_PER_REQUEST_PROFILE = 1000
 DEFAULT_MAX_REACHABILITY_TARGETS = 3
 DEFAULT_MAX_SELECT_OPTIONS_PER_FIELD = 5
@@ -1529,6 +1529,62 @@ def should_skip_active_action_candidate(candidate_url, page_url):
 
     if is_same_page_candidate(candidate_url, page_url):
         return True, "same-page"
+
+    return False, ""
+
+
+def should_skip_active_action(action, page_url):
+    action = action or {}
+    href = (action.get("href") or "").strip()
+    onclick = (action.get("onclick") or "").strip()
+    text = (action.get("text") or "").strip().lower()
+    name = (action.get("name") or "").strip().lower()
+    element_id = (action.get("id") or "").strip().lower()
+    tag = (action.get("tag") or "").strip().lower()
+    action_type = (action.get("type") or "").strip().lower()
+    page_url = (page_url or "").strip()
+
+    normalized_haystack = " ".join(
+        part for part in (text, name, element_id, href.lower(), onclick.lower())
+        if part
+    )
+
+    ui_only_tokens = (
+        "theme", "bootstrap", "dark-mode", "dark mode", "light-mode", "light mode",
+        "toggle-theme", "settheme", "color-scheme", "stylesheet", "skin",
+        "dropdown", "collapse", "accordion", "tooltip", "popover", "offcanvas",
+        "modal", "tab", "tabpanel", "nav-link", "menu", "sidebar",
+        "copy", "clipboard", "show password", "hide password", "password visibility",
+    )
+    ui_only_onclick_markers = (
+        "javascript:void", "return false", "classlist.", "toggleclass",
+        "setattribute(", "removeattribute(", ".focus(", ".blur(",
+        "modal", "dropdown", "collapse", "tooltip", "popover", "offcanvas",
+        "theme", "darkmode", "dark-mode", "clipboard", "copy(",
+    )
+
+    if href in {"", "#", "/#"} and not onclick:
+        return True, "empty-or-fragment-href"
+
+    if href.lower().startswith(("javascript:void", "javascript:;", "javascript:void(0)")):
+        return True, "javascript-void"
+
+    if href.startswith("#"):
+        return True, "fragment-href"
+
+    if any(token in normalized_haystack for token in ui_only_tokens):
+        return True, "ui-only-action"
+
+    lowered_onclick = onclick.lower()
+    if any(marker in lowered_onclick for marker in ui_only_onclick_markers):
+        return True, "ui-only-onclick"
+
+    if tag == "button" and action_type in {"button", ""} and not href and not onclick:
+        return True, "non-navigating-button"
+
+    skip_candidate, skip_reason = should_skip_active_action_candidate(href, page_url)
+    if href and skip_candidate:
+        return True, f"href-{skip_reason}"
 
     return False, ""
 
@@ -5103,6 +5159,13 @@ def summary_evidence_fields(result):
                 fields.append((key, value))
         return fields
 
+    if profile_name == "cookie-flags":
+        for key in ("cookie", "missing", "sensitive", "endpoint_count", "endpoint_list"):
+            value = evidence_fields.get(key)
+            if value:
+                fields.append((key, value))
+        return fields
+
     if profile_name == "ssrf":
         fetch_target = evidence_fields.get("target_url") or evidence_fields.get("target_label")
         if fetch_target:
@@ -5400,6 +5463,78 @@ def aggregate_clickjacking_results(results):
     return aggregated
 
 
+def aggregate_cookie_flag_results(results):
+    grouped = {}
+
+    for result in results:
+        evidence_fields = parse_evidence_fields(getattr(result, "evidence", ""))
+        signature = evidence_fields.get("signature", "") or "unknown"
+        cookie = evidence_fields.get("cookie", "") or getattr(result.insertion_point, "name", "") or "unknown"
+        missing = evidence_fields.get("missing", "") or "unknown"
+        sensitive = evidence_fields.get("sensitive", "") or "no"
+
+        key = (
+            result.profile_name,
+            signature,
+            cookie,
+            missing,
+            sensitive,
+        )
+        grouped.setdefault(key, []).append(result)
+
+    aggregated = []
+    confidence_rank = {"low": 1, "medium": 2, "high": 3}
+
+    for _, members in grouped.items():
+        primary = members[0]
+        endpoint_labels = []
+        best_confidence = primary.confidence
+
+        for item in members:
+            endpoint_labels.append(item.request_key)
+            if confidence_rank.get(item.confidence, 0) > confidence_rank.get(best_confidence, 0):
+                best_confidence = item.confidence
+
+        deduped_endpoints = []
+        seen = set()
+        for endpoint in endpoint_labels:
+            if endpoint in seen:
+                continue
+            seen.add(endpoint)
+            deduped_endpoints.append(endpoint)
+
+        evidence_fields = parse_evidence_fields(primary.evidence)
+        evidence_parts = []
+        if evidence_fields.get("cookie"):
+            evidence_parts.append(f"cookie={evidence_fields['cookie']}")
+        if evidence_fields.get("missing"):
+            evidence_parts.append(f"missing={evidence_fields['missing']}")
+        if evidence_fields.get("sensitive"):
+            evidence_parts.append(f"sensitive={evidence_fields['sensitive']}")
+        evidence_parts.append(f"endpoint_count={len(deduped_endpoints)}")
+        evidence_parts.append("endpoint_list=see-aggregate-detail")
+        if evidence_fields.get("signature"):
+            evidence_parts.append(f"signature={evidence_fields['signature']}")
+
+        aggregated.append(
+            CheckResult(
+                profile_name=primary.profile_name,
+                request_key=f"{len(deduped_endpoints)} endpoint(s)",
+                insertion_point=primary.insertion_point,
+                payload=primary.payload,
+                phase_name=primary.phase_name,
+                confidence=best_confidence,
+                evidence=" ".join(evidence_parts),
+                reflected=False,
+                request_metadata={
+                    "aggregate_member_requests": deduped_endpoints,
+                },
+            )
+        )
+
+    return aggregated
+
+
 def priority_label(result, use_color=True):
     diagnosis_score, confidence_score = result_priority(result)
     score = max(diagnosis_score, confidence_score)
@@ -5423,9 +5558,13 @@ def summarize_check_results(results):
         result for result in results
         if (getattr(result, "profile_name", "") or "").lower() == "clickjacking"
     ]
+    cookie_flag_results = [
+        result for result in results
+        if (getattr(result, "profile_name", "") or "").lower() == "cookie-flags"
+    ]
     non_security_header_results = [
         result for result in results
-        if (getattr(result, "profile_name", "") or "").lower() not in {"security-headers", "clickjacking"}
+        if (getattr(result, "profile_name", "") or "").lower() not in {"security-headers", "clickjacking", "cookie-flags"}
     ]
 
     grouped = {}
@@ -5457,6 +5596,8 @@ def summarize_check_results(results):
         summarized.extend(aggregate_security_header_results(security_header_results))
     if clickjacking_results:
         summarized.extend(aggregate_clickjacking_results(clickjacking_results))
+    if cookie_flag_results:
+        summarized.extend(aggregate_cookie_flag_results(cookie_flag_results))
     return summarized
 
 
@@ -7781,6 +7922,16 @@ async def process_active_actions(page, page_url, args, triggered_actions):
     context = page.context
 
     for action in actions:
+        skip_action, skip_reason = should_skip_active_action(action, page_url)
+        if skip_action:
+            logging.debug(
+                "Active action skipped before replay (%s): %s %s",
+                skip_reason,
+                action.get("tag", "element"),
+                action.get("text") or action.get("href") or action.get("id") or action.get("name") or "<unnamed>",
+            )
+            continue
+
         signature = build_active_action_signature(page_url, action)
         if signature in triggered_actions:
             continue
