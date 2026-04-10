@@ -1,311 +1,322 @@
 # BoberCrawler
 
-**BoberCrawler** is a Burp‑friendly, Playwright‑based web crawler designed for **security testing, reconnaissance, and dynamic web application exploration**.
+**BoberCrawler** is a Burp-friendly, Playwright-based crawler for security testing, reconnaissance, and controlled exploration of modern web applications.
 
-It focuses on:
+The current feature set documented below reflects the latest packaged CLI behavior in [`bober_crawler/cli.py`](./bober_crawler/cli.py).
 
-- staying strictly inside a defined scope (**protocol + host + path**)
-    
-- handling modern, JavaScript‑heavy websites
-    
-- avoiding recursive traps and infinite parameter explosions
-    
-- producing predictable, deduplicated crawling behavior suitable for pentesting workflows
-    
+## Features
 
-The crawler is intentionally **smart‑only**:  
-it does **not brute‑force raw URL permutations**, but instead applies controlled, deterministic logic to keep large sites (e.g. webshops) manageable.
+- Async Playwright crawl engine with Chromium
+- Strict scope enforcement by scheme + host + path prefix
+- Smart deduplication for crawl URLs and collected request specs
+- Seed discovery from `robots.txt`, `sitemap.xml`, and optional JSON input
+- Optional query-agnostic deduplication for filter-heavy endpoints
+- Recursive trap and state-token protection for self-reproducing URLs
+- Optional WebSocket-aware crawling for JS-gated applications
+- Optional active mode that submits discovered HTML forms with safe test values
+- Vulnerability workflow built on collected inputs and browser replay
+- Burp-friendly proxy support enabled by default
+- Timestamped log files and summary output with aggregate detail sections
 
----
+## Current Coverage
 
-## **Features**
+The crawler can currently collect and assess:
 
-✅ Async crawling using Playwright  
-✅ Works seamlessly with Burp Suite (proxy support)  
-✅ Precise scope control (scheme + host + path)  
-✅ Smart URL deduplication  
-✅ Optional query‑agnostic paths (ignore query string for selected endpoints)  
-✅ Recursive trap detection  
-✅ State‑token based recursion limiting (e.g. `embed`, `feed`, `rss`)  
-✅ WebSocket‑aware crawling for JS‑gated content  
-✅ Designed for large, filter‑heavy webshops  
-✅ Installable via **pipx**  
-✅ Automatic, timestamped log files per crawl
+- Crawl-discovered GET endpoints
+- Query-based request specs
+- URL-encoded POST form submissions discovered in the browser
+- Protected routes observed through `401` / `403` responses
 
----
+When vulnerability checks are enabled, the workflow currently includes:
 
-## **Project Structure**
+- Reflection
+- XSS
+- SSTI
+- SQL injection
+- Command injection
+- XXE
+- Path traversal
+- File read
+- Open redirect
+- CORS misconfiguration
+- SSRF
+- Access control reachability
+- Security headers audit
+- Clickjacking audit
+- Cookie flag review
+- Stored-input reachability via deferred markers
 
-```
-BoberCrawler/
-├── pyproject.toml
-├── requirements.txt
-├── bober_crawler/
-│   ├── __init__.py
-│   └── cli.py
-└── README.md
-```
+## Installation
 
----
-
-## **Installation**
-
-### 1️⃣ Install via pipx (recommended)
+### Install with pipx
 
 ```bash
 pipx install git+https://github.com/KZ5017/BoberCrawler.git
 ```
 
-This installs the `bober-crawler` command into an **isolated virtual environment**.
+### Install the Playwright browser once
 
----
-
-### 2️⃣ Install Playwright browser (required once)
-
-BoberCrawler uses Playwright and requires Chromium.
-
-If missing, the tool will tell you exactly what to run, for example:
+If Chromium is missing, the tool prints the exact command to install it. Typical form:
 
 ```bash
-/home/user/.local/share/pipx/venvs/bober-crawler/bin/python -m playwright install chromium
+python -m playwright install chromium
 ```
 
-💡 This keeps everything isolated inside the pipx environment  
-❌ No system‑wide installation is required
-
----
-
-### 3️⃣ Verify installation
+### Verify
 
 ```bash
 bober-crawler --help
 ```
 
-If the help screen appears without errors, you’re good to go.
-
----
-
-## **Usage**
-
-### Basic command structure
+## Basic Usage
 
 ```bash
-bober-crawler --start-url <URL> --scope <URL> [options]
+bober-crawler --start-url "https://example.com/" --scope "https://example.com"
 ```
 
-### Required parameters
-
-Although not enforced by argparse directly, the following parameters **must be provided**:
+Required arguments:
 
 - `--start-url`
-    
 - `--scope`
-    
 
----
+The `--scope` value defines where the crawler may go. It matches:
 
-## **Scope Handling (Important)**
+- scheme
+- hostname
+- path prefix
 
-The `--scope` parameter defines **where the crawler is allowed to go**.
-
-It includes:
-
-- protocol (`https`)
-    
-- hostname (`example.com`)
-    
-- path prefix (`/shop`)
-    
-
-### Example
+Example:
 
 ```bash
---scope 'https://example.com/shop'
+--scope "https://example.com/shop"
 ```
 
 Allowed:
 
-- `https://example.com/shop/page/1`
-    
-- `https://example.com/shop/?a=1`
-    
+- `https://example.com/shop`
+- `https://example.com/shop?page=2`
 - `https://example.com/shop/category/item`
-    
 
 Blocked:
 
-- `https://example.com/blog`
-    
 - `http://example.com/shop`
-    
-- `https://other.example.com/shop`
-    
+- `https://example.com/blog`
+- `https://admin.example.com/shop`
 
----
+## Proxy Handling
 
-## **Proxy Handling**
+By default the crawler assumes a local Burp-style proxy:
 
-By default, BoberCrawler assumes a **Burp proxy** is running:
-
-```
-127.0.0.1:8080
+```text
+http://127.0.0.1:8080
 ```
 
-You can override or disable this behavior.
-
-### Default (Burp)
-
-_No proxy flags required_
-
-### Custom proxy
+Use a custom proxy:
 
 ```bash
---proxy-host 192.168.1.111 --proxy-port 9090
+--proxy 127.0.0.1:9090
 ```
 
-### Disable proxy entirely
+or:
+
+```bash
+--proxy http://127.0.0.1:9090
+```
+
+Disable proxying entirely:
 
 ```bash
 --no-proxy
 ```
 
----
+Supported proxy schemes:
 
-## **Query‑Agnostic Paths**
+- `http`
+- `https`
+- `socks5`
 
-Some endpoints generate endless permutations via query parameters (filters, faceted search).
+## Crawl Behavior
 
-You can instruct the crawler to **ignore query strings** for specific paths during deduplication.
+### `--max-pages`
 
-### Example
+`--max-pages` currently limits the number of **collected request specs/endpoints**, not just the number of visited URLs.
 
-```bash
---query-agnostic-paths '/shop,/shop/'
-```
+That makes it much closer to "how many useful inputs/endpoints did the tool gather before stopping".
 
-This means:
+### Seed Sources
 
-```
-/shop/?a=1
-/shop/?b=2
-/shop/?a=1&b=2
-```
+The crawler can prime discovery from:
 
-➡️ all count as the **same endpoint** for crawling purposes.
+- `--start-url`
+- `robots.txt`
+- `sitemap.xml`
+- `--seed-json-file`
 
-Subpaths like `/shop/page/3/` are still fully crawled.
+The JSON seed file should contain `results[].url` entries.
 
----
+### Query-Agnostic Paths
 
-## **State Token Guard**
-
-Limits recursion caused by repeating tokens such as:
-
-- `embed`
-    
-- `feed`
-    
-- `rss2`
-    
-- similar self‑reproducing URL patterns
-    
-
-### Example
+Use this when endpoints produce endless query permutations:
 
 ```bash
---state-tokens embed,feed,rss2 --state-max-repeat 1
+--query-agnostic-paths "/shop,/search"
 ```
 
-If a token appears more than once in path or query values, the URL is skipped.
+### State Token Guard
 
----
+Use this to stop recursive URL patterns such as `embed`, `feed`, or similar state tokens:
 
-## **WebSocket‑Aware Crawling**
+```bash
+--state-tokens "embed,feed,rss2" --state-max-repeat 1
+```
 
-Some modern applications load content **only after a WebSocket connection is established**.
+### WebSocket-Aware Mode
 
-Enable WS‑aware mode to wait for DOM stabilization before extraction:
+For apps that reveal useful content only after WS bootstrapping:
 
 ```bash
 --ws-aware
 ```
 
-This is especially useful for:
+### WordPress Expansion
 
-- SPA dashboards
-    
-- JS‑heavy admin panels
-    
-- real‑time applications
-    
+Optional extra endpoint expansion for WordPress-like surfaces:
 
----
+```bash
+--wp-expand
+```
 
-## **Examples**
+## Active Mode And Vulnerability Checks
 
-Show built‑in usage examples:
+### Active Mode
+
+```bash
+--active-mode
+```
+
+This enables browser-side form discovery and submission using generated test values. The tool currently focuses on URL query inputs and URL-encoded POST forms for replayable testing.
+
+### Full Vulnerability Workflow
+
+```bash
+--check-vulnerabilities
+```
+
+This automatically enables `--active-mode` and runs the full finding pipeline on collected request specs and final audit targets.
+
+## Output And Logging
+
+Each run creates a timestamped log file like:
+
+```text
+example-com_root_2026-04-10_14-35.log
+```
+
+Log modes:
+
+- `--debug-level clean`
+- `--debug-level normal`
+- `--debug-level debug`
+
+Accepted aliases:
+
+- `1`, `low` -> `clean`
+- `2`, `medium` -> `normal`
+- `3`, `high` -> `debug`
+
+The vulnerability summary includes:
+
+- colored priority and confidence labels
+- grouped findings by profile
+- aggregate sections for consolidated findings such as security headers and clickjacking
+- an `AGGREGATE DETAIL` section in the log file
+- a final `[collected-endpoints]` inventory showing the deduplicated endpoint/request-spec list gathered during the run
+
+## Main CLI Options
+
+```text
+--example
+--start-url
+--scope
+--proxy
+--no-proxy
+--cookie
+--exclude-paths
+--query-agnostic-paths
+--state-tokens
+--state-max-repeat
+--timeout
+--delay
+--max-pages
+--max-depth
+--seed-json-file
+--active-mode
+--check-vulnerabilities
+--audit-sweep-concurrency
+--reachability-check-concurrency
+--debug-level
+--wp-expand
+--ws-aware
+```
+
+Concurrency options are safety-clamped to the current internal maximum.
+
+## Built-In Examples
+
+Show the tool's own example set:
 
 ```bash
 bober-crawler --example
 ```
 
-This prints multiple real‑world usage patterns, from minimal crawls to advanced pentest setups.
+Current examples include:
 
----
+- basic in-scope crawl
+- custom proxy usage
+- authenticated crawl with cookies
+- JS / WebSocket-heavy application crawl
+- WordPress / state-aware crawl
+- full vulnerability workflow
+- authenticated vulnerability assessment with tuned concurrency
+- focused crawl with custom seed JSON and stricter limits
 
-## **Logging**
+## Example Commands
 
-- A **new log file is generated per run**
-    
-- Filename format:
-    
-    ```
-    <host>_<path>_<YYYY-MM-DD_HH-MM>.log
-    ```
-    
-- Example:
-    
-    ```
-    example-com_cute_bober_2026-02-02_22-37.log
-    ```
-    
-- Logs are:
-    
-    - written to file
-        
-    - streamed to stdout
-        
+Basic crawl without proxy:
 
-Useful for replaying, auditing, and debugging crawl behavior.
+```bash
+bober-crawler --start-url "https://example.com/" --scope "https://example.com" --no-proxy
+```
 
----
+Authenticated crawl:
 
-## **Notes**
+```bash
+bober-crawler --start-url "https://example.com/account" --scope "https://example.com" --cookie "sessionid=abc123; csrftoken=xyz" --exclude-paths "/logout,/cdn,/static"
+```
 
-- This tool is **not** a brute‑force spider
-    
-- Designed for **controlled, intelligent discovery**
-    
-- Ideal for:
-    
-    - penetration tests
-        
-    - bug bounty reconnaissance
-        
-    - large e‑commerce platforms
-        
-    - Burp‑assisted analysis
-        
+Full vulnerability workflow:
 
----
+```bash
+bober-crawler --start-url "https://target.example/" --scope "https://target.example" --check-vulnerabilities --proxy 127.0.0.1:9090
+```
 
-## **Disclaimer**
+Focused crawl with custom seeds:
 
-Use this tool **only on systems you own or have explicit permission to test**.
+```bash
+bober-crawler --start-url "https://example.com/docs" --scope "https://example.com/docs" --seed-json-file ".\\results.json" --max-depth 3 --max-pages 120 --exclude-paths "/logout,/admin" --query-agnostic-paths "/search"
+```
 
----
+## Notes
 
-## **License**
+- This is not a brute-force spider
+- The crawler prefers deterministic, replayable discovery
+- It is designed to stay useful on large, dynamic, filter-heavy applications
+- Some vulnerability checks are heuristic and replay-based, so findings still need human validation
 
-MIT License  
-Feel free to modify, extend, and redistribute.
+## Disclaimer
+
+Use this tool only on systems you own or are explicitly authorized to test.
+
+## License
+
+MIT
